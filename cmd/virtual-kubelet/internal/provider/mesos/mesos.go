@@ -48,7 +48,6 @@ type MesosProvider struct { // nolint:golint
 	pods               map[string]*v1.Pod
 	config             MesosConfig
 	startTime          time.Time
-	notifier           func(*v1.Pod)
 	mesosScheduler     scheduler.Scheduler
 }
 
@@ -61,7 +60,7 @@ type MesosConfig struct { //nolint:golint
 	Scheduler *scheduler.Config `json:"scheduler,omitempty"`
 }
 
-// NewMesosProvider creates a new MesosProvider, which implements the PodNotifier interface
+// NewMesosProvider creates a new MesosProvider,
 func NewMesosProvider(providerConfig, nodeName, operatingSystem string, internalIP string, daemonEndpointPort int32) (*MesosProvider, error) {
 	config, err := loadConfig(providerConfig)
 	if err != nil {
@@ -76,11 +75,13 @@ func NewMesosProvider(providerConfig, nodeName, operatingSystem string, internal
 		pods:               make(map[string]*v1.Pod),
 		config:             config,
 		startTime:          time.Now(),
-		mesosScheduler:		scheduler.New(config.Scheduler),
+		mesosScheduler:     scheduler.New(config.Scheduler),
 	}
 
 	// Start the scheduler
 	go provider.mesosScheduler.Run()
+
+	provider.mesosScheduler.WaitReady()
 
 	return &provider, nil
 }
@@ -91,11 +92,11 @@ func loadConfig(providerConfig string) (config MesosConfig, err error) {
 	if err != nil {
 		return config, err
 	}
-	config = MesosConfig {
-		CPU: defaultCPUCapacity,
-		Memory: defaultMemoryCapacity,
-		Pods: defaultPodCapacity,
-		Storage: defaultStorageCapacity,
+	config = MesosConfig{
+		CPU:       defaultCPUCapacity,
+		Memory:    defaultMemoryCapacity,
+		Pods:      defaultPodCapacity,
+		Storage:   defaultStorageCapacity,
 		Scheduler: scheduler.DefaultConfig(),
 	}
 	err = json.Unmarshal(data, &config)
@@ -252,10 +253,10 @@ func (p *MesosProvider) ConfigureNode(ctx context.Context, n *v1.Node) {
 // Capacity returns a resource list containing the capacity limits.
 func (p *MesosProvider) capacity() v1.ResourceList {
 	return v1.ResourceList{
-		"cpu":    	resource.MustParse(p.config.CPU),
-		"memory": 	resource.MustParse(p.config.Memory),
-		"pods":   	resource.MustParse(p.config.Pods),
-		"storage":	resource.MustParse(p.config.Storage),
+		"cpu":     resource.MustParse(p.config.CPU),
+		"memory":  resource.MustParse(p.config.Memory),
+		"pods":    resource.MustParse(p.config.Pods),
+		"storage": resource.MustParse(p.config.Storage),
 	}
 }
 
@@ -410,7 +411,9 @@ func (p *MesosProvider) GetStatsSummary(ctx context.Context) (*stats.Summary, er
 // NotifyPods is called to set a pod notifier callback function. This should be called before any operations are done
 // within the provider.
 func (p *MesosProvider) NotifyPods(ctx context.Context, notifier func(*v1.Pod)) {
-	p.notifier = notifier
+	log.G(ctx).Info("receive NotifyPods")
+
+	p.mesosScheduler.NotifyPods(ctx, notifier)
 }
 
 // addAttributes adds the specified attributes to the provided span.

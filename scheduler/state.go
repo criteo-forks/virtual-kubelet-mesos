@@ -3,11 +3,12 @@ package scheduler
 import (
 	"log"
 
-	"github.com/mesos/mesos-go/api/v1/lib"
+	mesos "github.com/mesos/mesos-go/api/v1/lib"
 	"github.com/mesos/mesos-go/api/v1/lib/backoff"
 	"github.com/mesos/mesos-go/api/v1/lib/httpcli"
 	"github.com/mesos/mesos-go/api/v1/lib/httpcli/httpsched"
 	"github.com/mesos/mesos-go/api/v1/lib/scheduler/calls"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func buildMesosCaller(schedulerConfig *Config) calls.Caller {
@@ -46,7 +47,7 @@ func buildFrameworkInfo(schedulerConfig *Config) *mesos.FrameworkInfo {
 		frameworkInfo.FailoverTimeout = &failoverTimeout
 	}
 	if schedulerConfig.FrameworkID != "" {
-		frameworkInfo.ID = &mesos.FrameworkID {Value: schedulerConfig.FrameworkID}
+		frameworkInfo.ID = &mesos.FrameworkID{Value: schedulerConfig.FrameworkID}
 	}
 	if schedulerConfig.Role != "" {
 		frameworkInfo.Role = &schedulerConfig.Role
@@ -58,7 +59,7 @@ func buildFrameworkInfo(schedulerConfig *Config) *mesos.FrameworkInfo {
 	if schedulerConfig.Hostname != "" {
 		frameworkInfo.Hostname = &schedulerConfig.Hostname
 	}
-	
+
 	if len(schedulerConfig.Labels) > 0 {
 		log.Println("using labels:", schedulerConfig.Labels)
 		frameworkInfo.Labels = &mesos.Labels{Labels: schedulerConfig.Labels}
@@ -74,24 +75,29 @@ func buildFrameworkInfo(schedulerConfig *Config) *mesos.FrameworkInfo {
 
 func newStateStore(schedulerConfig *Config) *stateStore {
 	return &stateStore{
-		config:        schedulerConfig,
-		cli:           buildMesosCaller(schedulerConfig),
-		reviveTokens:  backoff.BurstNotifier(schedulerConfig.ReviveBurst, schedulerConfig.ReviveWait, schedulerConfig.ReviveWait, nil),
-		metricsAPI:    initMetrics(*schedulerConfig),
-		newPodMap:     NewMesosPodMap(),
-		runningPodMap: NewMesosPodMap(),
-		deletedPodMap: NewMesosPodMap(),
+		config:          schedulerConfig,
+		cli:             buildMesosCaller(schedulerConfig),
+		reviveTokens:    backoff.BurstNotifier(schedulerConfig.ReviveBurst, schedulerConfig.ReviveWait, schedulerConfig.ReviveWait, nil),
+		metricsAPI:      initMetrics(*schedulerConfig),
+		requestedPodMap: NewMesosPodMap(),
+		unknownPodMap:   NewMesosPodMap(),
+		runningPodMap:   NewMesosPodMap(),
+		deletedPodMap:   NewMesosPodMap(),
+		suppressed:      false,
 	}
 }
 
 type stateStore struct {
-	role          string
-	cli           calls.Caller
-	config        *Config
-	reviveTokens  <-chan struct{}
-	metricsAPI    *metricsAPI
-	err           error
-	newPodMap     *MesosPodMap
-	runningPodMap *MesosPodMap
-	deletedPodMap *MesosPodMap
+	role            string
+	cli             calls.Caller
+	config          *Config
+	reviveTokens    <-chan struct{}
+	metricsAPI      *metricsAPI
+	err             error
+	requestedPodMap *MesosPodMap
+	unknownPodMap   *MesosPodMap
+	runningPodMap   *MesosPodMap
+	deletedPodMap   *MesosPodMap
+	suppressed      bool
+	notifier        func(*corev1.Pod)
 }

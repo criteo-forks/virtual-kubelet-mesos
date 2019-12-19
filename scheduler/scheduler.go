@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/mesos/mesos-go/api/v1/lib"
+	mesos "github.com/mesos/mesos-go/api/v1/lib"
 	"github.com/mesos/mesos-go/api/v1/lib/backoff"
 	xmetrics "github.com/mesos/mesos-go/api/v1/lib/extras/metrics"
 	"github.com/mesos/mesos-go/api/v1/lib/extras/scheduler/callrules"
@@ -31,25 +31,28 @@ var (
 )
 
 type mesosScheduler struct {
-	quit   chan struct{}
-	config *Config
-	store  *stateStore
+	ready    chan struct{}
+	config   *Config
+	store    *stateStore
+	notifier func(*corev1.Pod)
 }
 
 type Scheduler interface {
 	// TODO @pires providers are stateless :(
 	// Run() (quit chan<- struct{}, err error)
 	Run()
+	WaitReady()
 	AddPod(pod *corev1.Pod) error
 	DeletePod(pod *corev1.Pod) error
 	UpdatePod(pod *corev1.Pod) error
 	GetPod(podNamespace, podName string) *corev1.Pod
 	ListPods() []*corev1.Pod
+	NotifyPods(context.Context, func(*corev1.Pod))
 }
 
 func New(config *Config) *mesosScheduler {
 	return &mesosScheduler{
-		quit:   make(chan struct{}, 1),
+		ready:  make(chan struct{}),
 		config: config,
 		store:  newStateStore(config),
 	}
@@ -63,6 +66,15 @@ func (sched *mesosScheduler) Run() {
 	sched.run()
 	//	}
 	//}()
+}
+
+func (sched *mesosScheduler) WaitReady() {
+	// Just wait 10 seconds
+	// TODO: improve this
+	timer := time.NewTimer(10 * time.Second)
+	log.Println("Waiting 10 seconds for reconciliation...")
+	<-timer.C
+	log.Println("Scheduler is ready.")
 }
 
 func (sched *mesosScheduler) run() error {
@@ -83,9 +95,15 @@ func (sched *mesosScheduler) run() error {
 
 	sched.store.cli = callrules.New(
 		callrules.WithFrameworkID(store.GetIgnoreErrors(fidStore)),
-		logCalls(map[scheduler.Call_Type]string{scheduler.Call_SUBSCRIBE: "connecting..."}),
+		logAllCalls(),
 		callMetrics(sched.store.metricsAPI, time.Now, true),
 	).Caller(sched.store.cli)
+
+	// Start reconciliation thread
+	ticker := time.NewTicker(5 * time.Minute)
+	done := make(chan struct{})
+
+	go sched.reconcileTasks(ticker, done)
 
 	err := controller.Run(
 		ctx,
@@ -103,121 +121,151 @@ func (sched *mesosScheduler) run() error {
 				}
 				return
 			}
-			log.Println("disconnected")
+			log.Println("Scheduler disconnected")
 		}),
 	)
+
+	// Stop reconciliation thread
+	ticker.Stop()
+	close(done)
+
 	if sched.store.err != nil {
 		err = sched.store.err
 	}
-
-	// wait to handle explicit quit
-	go func() {
-		<-sched.quit
-		// TODO quit what exactly?
-	}()
-
-	//return sched.quit, err
 	return err
 }
 
-func (sched *mesosScheduler) AddPod(pod *corev1.Pod) error {
-	podKey, err := buildPodNameFromPod(pod)
-	if err != nil {
-		return err
+func (sched *mesosScheduler) reconcileTasks(ticker *time.Ticker, done chan struct{}) {
+	log.Println("Start reconciliation thread")
+	reconcile(sched.store)
+	for {
+		select {
+		case <-done:
+			log.Println("Stop reconciliation thread")
+			return
+		case <-ticker.C:
+			reconcile(sched.store)
+		}
 	}
+}
 
-	sched.store.newPodMap.Set(podKey, &mesosPod{
-		pod:   pod,
-		tasks: buildPodTasks(pod),
+func (sched *mesosScheduler) AddPod(pod *corev1.Pod) error {
+	sched.store.requestedPodMap.Set(buildPodNameFromPod(pod), &mesosPod{
+		requestedPod: pod,
+		taskStatuses: make(map[string]mesos.TaskStatus, len(pod.Spec.Containers)),
 	})
+
+	if sched.store.suppressed {
+		tryReviveOffers(context.Background(), sched.store)
+	}
 
 	return nil
 }
 func (sched *mesosScheduler) DeletePod(pod *corev1.Pod) error {
-	podKey, err := buildPodNameFromPod(pod)
-	if err != nil {
-		return err
-	}
-
-	shutdownCall := func(mesosPod *mesosPod) error {
-		log.Printf(
-			"shutting down executor %q on agent %q",
-			mesosPod.executor.ExecutorID.Value,
-			mesosPod.agentId.Value)
-
-		shutdown := calls.Shutdown(
-			mesosPod.executor.ExecutorID.Value,
-			mesosPod.agentId.Value)
-
-		return calls.CallNoData(context.Background(), sched.store.cli, shutdown)
-	}
-
-	mesosPod, ok := sched.store.deletedPodMap.Get(podKey)
+	podKey := buildPodNameFromPod(pod)
+	mesosPod, ok := sched.store.requestedPodMap.GetAndRemove(podKey)
 	if ok {
-		return shutdownCall(mesosPod)
-	}
-
-	mesosPod, ok = sched.store.newPodMap.GetAndRemove(podKey)
-	if ok {
-		sched.store.deletedPodMap.Set(podKey, mesosPod)
-		log.Printf("pending pod %q has been deleted\n", podKey)
+		log.Printf("Pending pod %q has been deleted\n", podKey)
 		return nil
+	}
+
+	mesosPod, ok = sched.store.unknownPodMap.GetAndRemove(podKey)
+	if ok {
+		log.Printf("Unknown pod %q will be deleted\n", podKey)
+		shutdown, err := shutdownFromTaskStatus(mesosPod.taskStatuses)
+		if err != nil {
+			return err
+		}
+		return calls.CallNoData(context.Background(), sched.store.cli, shutdown)
 	}
 
 	mesosPod, ok = sched.store.runningPodMap.GetAndRemove(podKey)
 	if ok {
+		log.Printf("Sending shutdown call for running pod %q\n", podKey)
 		sched.store.deletedPodMap.Set(podKey, mesosPod)
-		return shutdownCall(mesosPod)
+		shutdown, err := shutdownFromTaskStatus(mesosPod.taskStatuses)
+		if err != nil {
+			return err
+		}
+		return calls.CallNoData(context.Background(), sched.store.cli, shutdown)
+	}
+
+	mesosPod, ok = sched.store.deletedPodMap.Get(podKey)
+	if ok {
+		log.Printf("Sending shutdown call again for deleted pod %q\n", podKey)
+		shutdown, err := shutdownFromTaskStatus(mesosPod.taskStatuses)
+		if err != nil {
+			return err
+		}
+		return calls.CallNoData(context.Background(), sched.store.cli, shutdown)
 	}
 
 	return fmt.Errorf("pod %q cannot be found\n", podKey)
 }
 
 func (sched *mesosScheduler) UpdatePod(pod *corev1.Pod) error {
-	// TODO signal pod update
-	return errors.New("TODO")
+	podKey := buildPodNameFromPod(pod)
+	p, ok := sched.store.unknownPodMap.GetAndRemove(podKey)
+	if !ok {
+		return errors.New("Updating pod not supported")
+	}
+	p.requestedPod = pod
+	sched.store.runningPodMap.Set(podKey, p)
+	return nil
 }
+
+// Return an immutable deep copy of a pod
 func (sched *mesosScheduler) GetPod(podNamespace, podName string) *corev1.Pod {
-	podKey, err := buildPodName(podNamespace, podName)
-	if err == nil {
-		if pod, ok := sched.store.newPodMap.Get(podKey); ok {
-			return pod.pod
-		}
-		if pod, ok := sched.store.runningPodMap.Get(podKey); ok {
-			return pod.pod
-		}
+	podKey := buildPodNameFromStrings(podNamespace, podName)
+	if pod, ok := sched.store.requestedPodMap.Get(podKey); ok {
+		return pod.requestedPod
+	}
+	if pod, ok := sched.store.runningPodMap.Get(podKey); ok {
+		return pod.requestedPod
+	}
+	if pod, ok := sched.store.deletedPodMap.Get(podKey); ok {
+		return pod.requestedPod
 	}
 
 	return nil
 }
 
 func (sched *mesosScheduler) ListPods() []*corev1.Pod {
-	// TODO should we return non-running pods too?
-	pods := make([]*corev1.Pod, sched.store.runningPodMap.Count(), sched.store.runningPodMap.Count())
+	//TODO: wait for first reconciliation?
+	pods := make([]*corev1.Pod, sched.store.runningPodMap.Count()+sched.store.unknownPodMap.Count())
 	for _, mesosPod := range sched.store.runningPodMap.Iter() {
-		pods = append(pods, mesosPod.pod)
+		pods = append(pods, mesosPod.requestedPod)
+	}
+	for _, mesosPod := range sched.store.unknownPodMap.Iter() {
+		pods = append(pods, buildDummyPodFromTaskStatuses(mesosPod.taskStatuses))
 	}
 
 	return pods
 }
 
+func (sched *mesosScheduler) NotifyPods(ctx context.Context, notifier func(*corev1.Pod)) {
+	sched.store.notifier = notifier
+}
+
+func shutdownFromTaskStatus(taskStatuses map[string]mesos.TaskStatus) (*scheduler.Call, error) {
+	for _, v := range taskStatuses {
+		return calls.Shutdown(v.ExecutorID.Value, v.AgentID.Value), nil
+	}
+	return nil, errors.New("Empty map")
+}
+
 // buildEventHandler generates and returns a handler to process events received from the subscription.
 func buildEventHandler(store *stateStore, fidStore store.Singleton) events.Handler {
-	// disable brief logs when verbose logs are enabled (there's no sense logging twice!)
-	logger := controller.LogEvents(nil).Unless(store.config.Verbose)
 	return eventrules.New(
-		logAllEvents().If(store.config.Verbose),
+		logAllEvents(),
 		eventMetrics(store.metricsAPI, time.Now, true),
 		controller.LiftErrors().DropOnError(),
 	).Handle(events.Handlers{
-		scheduler.Event_FAILURE: logger.HandleF(failure),
-		scheduler.Event_OFFERS:  trackOffersReceived(store).HandleF(resourceOffers(store)),
-		scheduler.Event_UPDATE:  controller.AckStatusUpdates(store.cli).AndThen().HandleF(statusUpdate(store)),
-		scheduler.Event_SUBSCRIBED: eventrules.New(
-			logger,
-			controller.TrackSubscription(fidStore, store.config.FailoverTimeout),
-		),
-	}.Otherwise(logger.HandleEvent))
+		scheduler.Event_FAILURE:    executorFailure(),
+		scheduler.Event_OFFERS:     trackOffersReceived(store).HandleF(resourceOffers(store)),
+		scheduler.Event_UPDATE:     controller.AckStatusUpdates(store.cli).AndThen().HandleF(statusUpdate(store)),
+		scheduler.Event_SUBSCRIBED: controller.TrackSubscription(fidStore, store.config.FailoverTimeout),
+	})
 }
 
 func trackOffersReceived(store *stateStore) eventrules.Rule {
@@ -229,26 +277,28 @@ func trackOffersReceived(store *stateStore) eventrules.Rule {
 	}
 }
 
-func failure(_ context.Context, e *scheduler.Event) error {
-	var (
-		f              = e.GetFailure()
-		eid, aid, stat = f.ExecutorID, f.AgentID, f.Status
-	)
-	if eid != nil {
-		// executor failed..
-		msg := "executor '" + eid.Value + "' terminated"
-		if aid != nil {
-			msg += " on agent '" + aid.Value + "'"
+func executorFailure() eventrules.Rule {
+	return func(ctx context.Context, e *scheduler.Event, err error, chain eventrules.Chain) (context.Context, *scheduler.Event, error) {
+		var (
+			f              = e.GetFailure()
+			eid, aid, stat = f.ExecutorID, f.AgentID, f.Status
+		)
+		if eid != nil {
+			// executor failed..
+			msg := "executor '" + eid.Value + "' terminated"
+			if aid != nil {
+				msg += " on agent '" + aid.Value + "'"
+			}
+			if stat != nil {
+				msg += " with status=" + strconv.Itoa(int(*stat))
+			}
+			log.Println(msg)
+		} else if aid != nil {
+			// agent failed..
+			log.Println("agent '" + aid.Value + "' terminated")
 		}
-		if stat != nil {
-			msg += " with status=" + strconv.Itoa(int(*stat))
-		}
-		log.Println(msg)
-	} else if aid != nil {
-		// agent failed..
-		log.Println("agent '" + aid.Value + "' terminated")
+		return chain(ctx, e, err)
 	}
-	return nil
 }
 
 func resourceOffers(store *stateStore) events.HandlerFunc {
@@ -266,6 +316,8 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 			}
 		)
 
+		store.suppressed = false
+
 		for i := range offers {
 			var (
 				remainingOfferedResources = mesos.Resources(offers[i].Resources)
@@ -276,7 +328,7 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 			}
 
 			// decline if there are no new pods
-			if store.newPodMap.Count() == 0 {
+			if store.requestedPodMap.Count() == 0 {
 				log.Printf("no new pods. rejecting offer with id %q\n", offers[i].ID.Value)
 				// send Reject call to Mesos
 				reject := calls.Decline(offers[i].ID).With(callOption)
@@ -285,16 +337,18 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 					log.Printf("failed to reject offer with id %q. err %+v\n", offers[i].ID.Value, err)
 				}
 				offersDeclined++
+				// TODO: backoff mechanism?
+				suppressOffers(ctx, store)
 				continue
 			}
 
-			firstNewPodName := store.newPodMap.Keys()[0]
-			pod, _ := store.newPodMap.Get(firstNewPodName)
+			firstNewPodName := store.requestedPodMap.Keys()[0]
+			pod, _ := store.requestedPodMap.Get(firstNewPodName)
 
 			flattened := remainingOfferedResources.ToUnreserved()
 
 			// TODO @pires this only works if requests are defined
-			taskGroupWantsResources := sumPodResources(pod.pod)
+			taskGroupWantsResources := sumPodResources(pod.requestedPod)
 
 			if store.config.Verbose {
 				log.Printf("Pod %q wants the following resources %q", firstNewPodName, taskGroupWantsResources.String())
@@ -302,7 +356,7 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 
 			// decline if there offer doesn't fit pod (executor + tasks) resources request
 			if !resources.ContainsAll(flattened, executorWantsResources.Plus(taskGroupWantsResources...)) ||
-			 !(offers[i].Hostname == "mesos-slave004-am6.central.criteo.preprod") {
+				!(offers[i].Hostname == "mesos-slave004-am6.central.criteo.preprod") {
 				log.Printf("not enough resources in offer. rejecting offer with id %q\n", offers[i].ID.Value)
 				// send Reject call to Mesos
 				reject := calls.Decline(offers[i].ID).With(callOption)
@@ -321,10 +375,8 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 				}
 			}
 
-			processedTasks := pod.tasks
-
 			if store.config.Verbose {
-				log.Printf("Pod %q has %d containers\n", firstNewPodName, len(pod.pod.Spec.Containers))
+				log.Printf("Pod %q has %d containers\n", firstNewPodName, len(pod.requestedPod.Spec.Containers))
 			}
 
 			// Prepare executor
@@ -332,15 +384,17 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 			found := func() mesos.Resources {
 				return resources.Find(executorWantsResources, flattened...)
 			}()
-			executorInfo.ExecutorID = mesos.ExecutorID{Value: "exec-" + firstNewPodName}
+			executorInfo.ExecutorID = mesos.ExecutorID{Value: firstNewPodName}
 			executorInfo.Resources = found
-			pod.executor = &executorInfo
-			pod.agentId = &offers[i].AgentID
 
 			remainingOfferedResources.Subtract(found...)
 			flattened = remainingOfferedResources.ToUnreserved()
 
-			for pos, containerSpec := range pod.pod.Spec.Containers {
+			// Build a TaskInfo for each container in the Kubernetes Pod.
+			cap := len(pod.requestedPod.Spec.Containers)
+			processedTasks := make([]mesos.TaskInfo, cap, cap)
+
+			for pos, containerSpec := range pod.requestedPod.Spec.Containers {
 				taskWantsResources := calculateTaskResources(containerSpec)
 
 				if store.config.Verbose {
@@ -360,10 +414,11 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 					log.Printf("launching pod %q using offer %q\n", firstNewPodName, offers[i].ID.Value)
 				}
 
-				task := pod.tasks[pos]
+				task := buildPodTask(pod.requestedPod, &containerSpec)
 				task.AgentID = offers[i].AgentID
 				task.Resources = found
-				processedTasks[pos] = task // TODO is this assignment needed?
+				processedTasks[pos] = task
+
 				remainingOfferedResources.Subtract(found...)
 				flattened = remainingOfferedResources.ToUnreserved()
 				//}
@@ -379,23 +434,23 @@ func resourceOffers(store *stateStore) events.HandlerFunc {
 				calls.OfferOperations{calls.OpLaunchGroup(executorInfo, processedTasks...)}.WithOffers(offers[i].ID),
 			).With(callOption)
 
+			// move pod to running pod
+			pod, ok := store.requestedPodMap.GetAndRemove(firstNewPodName)
+			if ok {
+				store.runningPodMap.Set(firstNewPodName, pod)
+			} else {
+				log.Printf("failed to move pod %+v to runningpod map", pod)
+			}
+
 			// send Accept call to Mesos
 			err := calls.CallNoData(ctx, store.cli, accept)
 			if err != nil {
 				log.Printf("failed to launch tasks: %+v", err)
+				pod.requestedPod.Status.Phase = "Failed"
 			} else {
 				if n := len(processedTasks); n > 0 {
 					tasksLaunchedThisCycle += n
 				}
-			}
-
-			// move pod to running pod
-			pod, ok := store.newPodMap.GetAndRemove(firstNewPodName)
-			if ok {
-				pod.tasks = processedTasks
-				store.runningPodMap.Set(firstNewPodName, pod)
-			} else {
-				log.Printf("failed to move pod %+v to runningpod map", pod)
 			}
 		}
 
@@ -413,30 +468,58 @@ func statusUpdate(store *stateStore) events.HandlerFunc {
 	return func(ctx context.Context, e *scheduler.Event) error {
 		s := e.GetUpdate().GetStatus()
 		if store.config.Verbose {
-			msg := "Task " + s.TaskID.Value + " is in store " + s.GetState().String()
+			msg := "Task " + s.TaskID.Value + " is in state " + s.GetState().String()
 			if m := s.GetMessage(); m != "" {
 				msg += " with message '" + m + "'"
 			}
 			log.Println(msg)
 		}
 
-		pod, _ := store.runningPodMap.Get(s.TaskID.Value)
-		log.Println(pod)
-
-		switch st := s.GetState(); st {
-		case mesos.TASK_FINISHED:
-			store.metricsAPI.tasksFinished()
-			tryReviveOffers(ctx, store)
-
-		case mesos.TASK_LOST, mesos.TASK_KILLED, mesos.TASK_FAILED, mesos.TASK_ERROR:
-			store.err = errors.New("Exiting because task " + s.GetTaskID().Value +
-				" is in an unexpected store " + st.String() +
-				" with reason " + s.GetReason().String() +
-				" from source " + s.GetSource().String() +
-				" with message '" + s.GetMessage() + "'")
+		key := buildPodNameFromTaskStatus(&s)
+		pod, ok := store.runningPodMap.Get(key)
+		if !ok {
+			pod, ok = store.deletedPodMap.Get(key)
+			//TODO: remove pod when all executor is stopped?
 		}
-		return nil
+		if ok {
+			// Pod already running, update or append status
+			pod.taskStatuses[s.GetTaskID().Value] = s
+			pod.requestedPod = updatePodFromTaskStatus(pod.requestedPod, s)
+			log.Println("Notifying Pod Status update for " + key)
+			store.notifier(pod.requestedPod)
+			return nil
+		} else {
+			pod, ok = store.unknownPodMap.Get(key)
+			if ok {
+				pod.taskStatuses[s.GetTaskID().Value] = s
+			} else {
+				switch s.GetState() {
+				case mesos.TASK_RUNNING, mesos.TASK_STAGING, mesos.TASK_STARTING:
+					pod = &mesosPod{
+						taskStatuses: make(map[string]mesos.TaskStatus, 1),
+					}
+					pod.taskStatuses[s.GetTaskID().Value] = s
+					store.unknownPodMap.Set(key, pod)
+				default:
+					return errors.New("Failed/Terminated unknown Task ID: " + s.TaskID.Value)
+				}
+			}
+			log.Println("Notifying Pod Status update for unknown pod " + key)
+			store.notifier(buildDummyPodFromTaskStatuses(pod.taskStatuses))
+			return nil
+		}
 	}
+}
+
+func suppressOffers(ctx context.Context, store *stateStore) {
+	if !store.suppressed {
+		log.Println("suppressing offers")
+		store.suppressed = true
+		if err := calls.CallNoData(ctx, store.cli, calls.Suppress()); err != nil {
+			log.Printf("failed to suppress offers: %+v", err)
+		}
+	}
+	return
 }
 
 func tryReviveOffers(ctx context.Context, store *stateStore) {
@@ -454,12 +537,8 @@ func tryReviveOffers(ctx context.Context, store *stateStore) {
 	}
 }
 
-// logAllEvents logs every observed event; this is somewhat expensive to do
-func logAllEvents() eventrules.Rule {
-	return func(ctx context.Context, e *scheduler.Event, err error, ch eventrules.Chain) (context.Context, *scheduler.Event, error) {
-		log.Printf("%+v\n", *e)
-		return ch(ctx, e, err)
-	}
+func reconcile(store *stateStore) {
+	calls.CallNoData(context.Background(), store.cli, calls.Reconcile())
 }
 
 // eventMetrics logs metrics for every processed API event
@@ -482,12 +561,48 @@ func callMetrics(metricsAPI *metricsAPI, clock func() time.Time, timingMetrics b
 	return callrules.Metrics(harness, nil)
 }
 
-// logCalls logs a specific message string when a particular call-type is observed
-func logCalls(messages map[scheduler.Call_Type]string) callrules.Rule {
-	return func(ctx context.Context, c *scheduler.Call, r mesos.Response, err error, ch callrules.Chain) (context.Context, *scheduler.Call, mesos.Response, error) {
-		if message, ok := messages[c.GetType()]; ok {
-			log.Println(message)
+func logAllEvents() eventrules.Rule {
+	return func(ctx context.Context, e *scheduler.Event, err error, ch eventrules.Chain) (context.Context, *scheduler.Event, error) {
+		message := ""
+		switch e.Type {
+		case scheduler.Event_SUBSCRIBED:
+			message = fmt.Sprint("FrameworkID %s", e.GetSubscribed().GetFrameworkID().Value)
+		case scheduler.Event_OFFERS:
+			message = fmt.Sprintf("%d offers", len(e.GetOffers().GetOffers()))
+		case scheduler.Event_RESCIND:
+			message = e.GetRescind().GetOfferID().Value
+		case scheduler.Event_UPDATE:
+			s := e.GetUpdate().GetStatus()
+			message = fmt.Sprintf("%s for task %s", s.GetState(), s.GetTaskID())
+		case scheduler.Event_MESSAGE:
+			message = fmt.Sprintf("%s", e.GetMessage().GetData())
+		case scheduler.Event_FAILURE:
+			f := e.GetFailure()
+			message = fmt.Sprintf("agent %s executor %s", f.AgentID.GetValue(), f.ExecutorID.GetValue())
+		case scheduler.Event_ERROR:
+			message = e.GetError().GetMessage()
 		}
+		log.Println("event", e.Type, message)
+		return ch(ctx, e, err)
+	}
+}
+
+func logAllCalls() callrules.Rule {
+	return func(ctx context.Context, c *scheduler.Call, r mesos.Response, err error, ch callrules.Chain) (context.Context, *scheduler.Call, mesos.Response, error) {
+		message := ""
+		switch c.GetType() {
+		case scheduler.Call_ACCEPT:
+			for _, o := range c.GetAccept().GetOperations() {
+				if message != "" {
+					message += ", "
+				}
+				message += o.GetType().String()
+				if o.GetType() == mesos.Offer_Operation_LAUNCH_GROUP {
+					message += " " + o.GetLaunchGroup().GetExecutor().ExecutorID.Value
+				}
+			}
+		}
+		log.Println("call", c.GetType(), message)
 		return ch(ctx, c, r, err)
 	}
 }

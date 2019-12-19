@@ -3,16 +3,13 @@ package scheduler
 import (
 	"sync"
 
-	"github.com/mesos/mesos-go/api/v1/lib"
-
+	mesos "github.com/mesos/mesos-go/api/v1/lib"
 	corev1 "k8s.io/api/core/v1"
 )
 
 type mesosPod struct {
-	pod      *corev1.Pod
-	agentId  *mesos.AgentID
-	executor *mesos.ExecutorInfo
-	tasks    []mesos.TaskInfo
+	requestedPod *corev1.Pod
+	taskStatuses map[string]mesos.TaskStatus
 }
 
 type MesosPodMap struct {
