@@ -141,6 +141,17 @@ func runRootCommand(ctx context.Context, s *provider.Store, c Opts) error {
 	}
 
 	pNode := NodeFromProvider(ctx, c.NodeName, taint, p, c.Version)
+	n, err := client.CoreV1().Nodes().Get(pNode.Name, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			n, err = client.CoreV1().Nodes().Create(pNode)
+			if err != nil {
+				return errors.New("Can't creat node " + pNode.String())
+			}
+		}
+	}
+	p.CreatedNode(n)
+
 	nodeRunner, err := node.NewNodeController(
 		node.NaiveNodeProvider{},
 		pNode,

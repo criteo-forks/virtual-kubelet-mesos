@@ -79,9 +79,9 @@ func NewMesosProvider(providerConfig, nodeName, operatingSystem string, internal
 	}
 
 	// Start the scheduler
-	go provider.mesosScheduler.Run()
+	//go provider.mesosScheduler.Run()
 
-	provider.mesosScheduler.WaitReady()
+	//provider.mesosScheduler.WaitReady()
 
 	return &provider, nil
 }
@@ -248,6 +248,10 @@ func (p *MesosProvider) ConfigureNode(ctx context.Context, n *v1.Node) {
 	n.Status.NodeInfo.OperatingSystem = os
 	n.Status.NodeInfo.Architecture = "amd64"
 	n.ObjectMeta.Labels["alpha.service-controller.kubernetes.io/exclude-balancer"] = "true"
+}
+
+func (p *MesosProvider) CreatedNode(n *v1.Node) {
+	go p.mesosScheduler.Run(n)
 }
 
 // Capacity returns a resource list containing the capacity limits.

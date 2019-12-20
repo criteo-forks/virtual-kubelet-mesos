@@ -9,6 +9,7 @@ import (
 	"github.com/mesos/mesos-go/api/v1/lib/httpcli/httpsched"
 	"github.com/mesos/mesos-go/api/v1/lib/scheduler/calls"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func buildMesosCaller(schedulerConfig *Config) calls.Caller {
@@ -33,9 +34,10 @@ func buildMesosCaller(schedulerConfig *Config) calls.Caller {
 	}))
 }
 
-func buildFrameworkInfo(schedulerConfig *Config) *mesos.FrameworkInfo {
+func buildFrameworkInfo(schedulerConfig *Config, uid types.UID) *mesos.FrameworkInfo {
 	failoverTimeout := schedulerConfig.FailoverTimeout.Seconds()
 	frameworkInfo := &mesos.FrameworkInfo{
+		ID:         &mesos.FrameworkID{Value: string(uid)},
 		User:       schedulerConfig.User,
 		Name:       schedulerConfig.Name,
 		Checkpoint: &schedulerConfig.Checkpoint,
@@ -45,9 +47,6 @@ func buildFrameworkInfo(schedulerConfig *Config) *mesos.FrameworkInfo {
 	}
 	if schedulerConfig.FailoverTimeout > 0 {
 		frameworkInfo.FailoverTimeout = &failoverTimeout
-	}
-	if schedulerConfig.FrameworkID != "" {
-		frameworkInfo.ID = &mesos.FrameworkID{Value: schedulerConfig.FrameworkID}
 	}
 	if schedulerConfig.Role != "" {
 		frameworkInfo.Role = &schedulerConfig.Role

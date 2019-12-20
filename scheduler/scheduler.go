@@ -40,7 +40,7 @@ type mesosScheduler struct {
 type Scheduler interface {
 	// TODO @pires providers are stateless :(
 	// Run() (quit chan<- struct{}, err error)
-	Run()
+	Run(node *corev1.Node)
 	WaitReady()
 	AddPod(pod *corev1.Pod) error
 	DeletePod(pod *corev1.Pod) error
@@ -58,12 +58,12 @@ func New(config *Config) *mesosScheduler {
 	}
 }
 
-func (sched *mesosScheduler) Run() {
+func (sched *mesosScheduler) Run(node *corev1.Node) {
 	// TODO log errors when they happen
 	// TODO recover panics and rerun
 	//defer func() {
 	//	if r := recover(); r != nil {
-	sched.run()
+	sched.run(node)
 	//	}
 	//}()
 }
@@ -71,13 +71,13 @@ func (sched *mesosScheduler) Run() {
 func (sched *mesosScheduler) WaitReady() {
 	// Just wait 10 seconds
 	// TODO: improve this
-	timer := time.NewTimer(10 * time.Second)
+	timer := time.NewTimer(3 * time.Second)
 	log.Println("Waiting 10 seconds for reconciliation...")
 	<-timer.C
 	log.Println("Scheduler is ready.")
 }
 
-func (sched *mesosScheduler) run() error {
+func (sched *mesosScheduler) run(n *corev1.Node) error {
 	log.Printf("Mesos scheduler running with configuration: %+v", sched.config)
 
 	ctx, _ := context.WithCancel(context.Background())
@@ -99,15 +99,17 @@ func (sched *mesosScheduler) run() error {
 		callMetrics(sched.store.metricsAPI, time.Now, true),
 	).Caller(sched.store.cli)
 
-	// Start reconciliation thread
+	// Start reconciliation ticker
 	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 	done := make(chan struct{})
+	defer close(done)
 
 	go sched.reconcileTasks(ticker, done)
 
 	err := controller.Run(
 		ctx,
-		buildFrameworkInfo(sched.store.config),
+		buildFrameworkInfo(sched.store.config, n.UID),
 		sched.store.cli,
 		controller.WithEventHandler(buildEventHandler(sched.store, fidStore)),
 		controller.WithFrameworkID(store.GetIgnoreErrors(fidStore)),
@@ -125,10 +127,6 @@ func (sched *mesosScheduler) run() error {
 		}),
 	)
 
-	// Stop reconciliation thread
-	ticker.Stop()
-	close(done)
-
 	if sched.store.err != nil {
 		err = sched.store.err
 	}
@@ -136,12 +134,12 @@ func (sched *mesosScheduler) run() error {
 }
 
 func (sched *mesosScheduler) reconcileTasks(ticker *time.Ticker, done chan struct{}) {
-	log.Println("Start reconciliation thread")
+	log.Println("Start reconciliation ticker")
 	reconcile(sched.store)
 	for {
 		select {
 		case <-done:
-			log.Println("Stop reconciliation thread")
+			log.Println("Stop reconciliation ticker")
 			return
 		case <-ticker.C:
 			reconcile(sched.store)
