@@ -58,7 +58,7 @@ func sumPodResources(pod *corev1.Pod) mesos.Resources {
 
 // buildPodTask creates a new Mesos Task based on a Kubernetes pod container definition.
 func buildPodTask(pod *corev1.Pod, containerSpec *corev1.Container) mesos.TaskInfo {
-	taskId := mesos.TaskID{Value: containerSpec.Name}
+	taskId := mesos.TaskID{Value: buildPodNameFromPod(pod) + "=" + containerSpec.Name}
 
 	// Build task environment variables.
 	var taskEnvVars []mesos.Environment_Variable
@@ -83,13 +83,25 @@ func buildPodTask(pod *corev1.Pod, containerSpec *corev1.Container) mesos.TaskIn
 		},
 		// TODO @pires build command info properly based on podSpec.Command, podSpec.Args, etc.
 		Command: &mesos.CommandInfo{
-			Shell: proto.Bool(false),
-			//Value:     proto.String(strings.Join(containerSpec.Command, " ")),
-			//Arguments: containerSpec.Args,
+			Shell:     proto.Bool(false),
+			Value:     proto.String(strings.Join(containerSpec.Command, " ")),
+			Arguments: containerSpec.Args,
 			Environment: &mesos.Environment{
 				Variables: taskEnvVars,
 			},
 		},
+	}
+
+	// See: http://mesos.apache.org/documentation/latest/isolators/docker-runtime/
+	if len(containerSpec.Command) > 0 {
+		task.Command.Value = proto.String(containerSpec.Command[0])
+		args := containerSpec.Command
+		for _, s := range containerSpec.Args {
+			args = append(args, s)
+		}
+		task.Command.Arguments = args
+	} else if len(containerSpec.Args) > 0 {
+		task.Command.Arguments = containerSpec.Args
 	}
 	return task
 }
@@ -145,7 +157,7 @@ func buildDummyPodFromTaskStatuses(taskStatuses map[string]mesos.TaskStatus) *co
 	podNamespace, podName := "", ""
 
 	for name, task := range taskStatuses {
-		podNamespace, podName = splitPodKeyName(task.GetExecutorID().GetValue())
+		podNamespace, podName, _ = splitPodKeyName(task.GetTaskID().Value)
 		container := corev1.Container{
 			Name: name,
 		}
@@ -177,11 +189,16 @@ func buildDummyPodFromTaskStatuses(taskStatuses map[string]mesos.TaskStatus) *co
 	}
 }
 
-func updatePodFromTaskStatus(pod *corev1.Pod, status mesos.TaskStatus) *corev1.Pod {
+func updatePodFromTaskStatus(pod *corev1.Pod, container string, status mesos.TaskStatus) *corev1.Pod {
 	containerStatus := corev1.ContainerStatus{
-		Name:  status.GetTaskID().Value,
+		Name:  container,
 		State: mesosStateToContainerState(status),
 	}
+	//TODO: readiness probe?
+	if containerStatus.State.Running != nil {
+		containerStatus.Ready = true
+	}
+
 	if len(pod.Status.ContainerStatuses) == 0 {
 		pod.Status.ContainerStatuses = make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
 	}
@@ -248,12 +265,19 @@ func buildPodNameFromStrings(namespace string, name string) string {
 	return namespace + "=" + name
 }
 
-func buildPodNameFromTaskStatus(status *mesos.TaskStatus) string {
-	//n, p, _ := cache.SplitMetaNamespaceKey(status.GetExecutorID().GetValue())
-	return status.GetExecutorID().GetValue()
+func buildPodNameFromTaskStatus(status *mesos.TaskStatus) (string, string) {
+	n, p, c := splitPodKeyName(status.GetTaskID().Value)
+	return buildPodNameFromStrings(n, p), c
 }
 
-func splitPodKeyName(key string) (string, string) {
+func splitPodKeyName(key string) (string, string, string) {
 	parts := strings.Split(key, "=")
-	return parts[0], parts[1]
+	switch len(parts) {
+	case 3:
+		return parts[0], parts[1], parts[2]
+	case 2:
+		return parts[0], parts[1], ""
+	default:
+		return key, "", ""
+	}
 }

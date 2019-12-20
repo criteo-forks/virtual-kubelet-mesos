@@ -247,7 +247,9 @@ func (sched *mesosScheduler) NotifyPods(ctx context.Context, notifier func(*core
 
 func shutdownFromTaskStatus(taskStatuses map[string]mesos.TaskStatus) (*scheduler.Call, error) {
 	for _, v := range taskStatuses {
-		return calls.Shutdown(v.ExecutorID.Value, v.AgentID.Value), nil
+		if v.ExecutorID != nil {
+			return calls.Shutdown(v.ExecutorID.Value, v.AgentID.Value), nil
+		}
 	}
 	return nil, errors.New("Empty map")
 }
@@ -473,7 +475,7 @@ func statusUpdate(store *stateStore) events.HandlerFunc {
 			log.Println(msg)
 		}
 
-		key := buildPodNameFromTaskStatus(&s)
+		key, container := buildPodNameFromTaskStatus(&s)
 		pod, ok := store.runningPodMap.Get(key)
 		if !ok {
 			pod, ok = store.deletedPodMap.Get(key)
@@ -481,22 +483,22 @@ func statusUpdate(store *stateStore) events.HandlerFunc {
 		}
 		if ok {
 			// Pod already running, update or append status
-			pod.taskStatuses[s.GetTaskID().Value] = s
-			pod.requestedPod = updatePodFromTaskStatus(pod.requestedPod, s)
+			pod.taskStatuses[container] = s
+			pod.requestedPod = updatePodFromTaskStatus(pod.requestedPod, container, s)
 			log.Println("Notifying Pod Status update for " + key)
 			store.notifier(pod.requestedPod)
 			return nil
 		} else {
 			pod, ok = store.unknownPodMap.Get(key)
 			if ok {
-				pod.taskStatuses[s.GetTaskID().Value] = s
+				pod.taskStatuses[container] = s
 			} else {
 				switch s.GetState() {
 				case mesos.TASK_RUNNING, mesos.TASK_STAGING, mesos.TASK_STARTING:
 					pod = &mesosPod{
 						taskStatuses: make(map[string]mesos.TaskStatus, 1),
 					}
-					pod.taskStatuses[s.GetTaskID().Value] = s
+					pod.taskStatuses[container] = s
 					store.unknownPodMap.Set(key, pod)
 				default:
 					return errors.New("Failed/Terminated unknown Task ID: " + s.TaskID.Value)
