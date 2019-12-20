@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"strings"
+	"time"
 
 	"github.com/gogo/protobuf/proto"
 	mesos "github.com/mesos/mesos-go/api/v1/lib"
@@ -81,11 +82,8 @@ func buildPodTask(pod *corev1.Pod, containerSpec *corev1.Container) mesos.TaskIn
 				},
 			},
 		},
-		// TODO @pires build command info properly based on podSpec.Command, podSpec.Args, etc.
 		Command: &mesos.CommandInfo{
-			Shell:     proto.Bool(false),
-			Value:     proto.String(strings.Join(containerSpec.Command, " ")),
-			Arguments: containerSpec.Args,
+			Shell: proto.Bool(false),
 			Environment: &mesos.Environment{
 				Variables: taskEnvVars,
 			},
@@ -194,9 +192,14 @@ func updatePodFromTaskStatus(pod *corev1.Pod, container string, status mesos.Tas
 		Name:  container,
 		State: mesosStateToContainerState(status),
 	}
-	//TODO: readiness probe?
+	//TODO: use readiness probe?
 	if containerStatus.State.Running != nil {
 		containerStatus.Ready = true
+	}
+	if status.GetContainerStatus() != nil {
+		if status.GetContainerStatus().GetContainerID() != nil {
+			containerStatus.ContainerID = status.GetContainerStatus().GetContainerID().GetValue()
+		}
 	}
 
 	if len(pod.Status.ContainerStatuses) == 0 {
@@ -212,31 +215,58 @@ func updatePodFromTaskStatus(pod *corev1.Pod, container string, status mesos.Tas
 	if !statusUpdated {
 		pod.Status.ContainerStatuses = append(pod.Status.ContainerStatuses, containerStatus)
 	}
-	failed := false
+
+	// Update Phase
+	failed := 0
+	finished := 0
+	running := 0
+	waiting := 0
 	for _, s := range pod.Status.ContainerStatuses {
 		if s.State.Terminated != nil {
 			if s.State.Terminated.Reason == "Finished" {
-				continue
+				finished += 1
 			} else {
-				failed = true
+				failed += 1
 			}
-		}
-		if s.State.Running != nil {
-			pod.Status.Phase = corev1.PodRunning
-			return pod
-		}
-		if s.State.Waiting != nil {
-			pod.Status.Phase = corev1.PodPending
-			return pod
+		} else if s.State.Running != nil {
+			running += 1
+		} else if s.State.Waiting != nil {
+			waiting += 1
 		}
 	}
-	if failed {
+	if waiting > 0 {
+		pod.Status.Phase = corev1.PodPending
+	} else if running > 0 {
+		pod.Status.Phase = corev1.PodRunning
+	} else if failed > 0 {
 		pod.Status.Phase = corev1.PodFailed
-		return pod
-	} else {
+	} else if finished > 0 {
 		pod.Status.Phase = corev1.PodSucceeded
-		return pod
+	} else {
+		pod.Status.Phase = corev1.PodUnknown
 	}
+
+	// Update Conditions
+	now := metav1.NewTime(time.Now())
+	podReady := corev1.PodCondition{
+		LastProbeTime:      now,
+		LastTransitionTime: now,
+		Status:             corev1.ConditionTrue,
+		Type:               corev1.PodReady,
+	}
+	podIsReady := false
+	for i, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			podReady.LastTransitionTime = c.LastTransitionTime
+			pod.Status.Conditions[i] = podReady
+			podIsReady = true
+		}
+	}
+	if !podIsReady && pod.Status.Phase == corev1.PodRunning {
+		pod.Status.Conditions = append(pod.Status.Conditions, podReady)
+	}
+
+	return pod
 }
 
 // buildDefaultExecutorInfo returns the protof of a default executor.
