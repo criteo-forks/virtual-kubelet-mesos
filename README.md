@@ -5,10 +5,25 @@ Mesos cluster.
 
 ## Features
 
-* Add pod
+* Add pod and convert PodSpec to Mesos TaskGroup
 * Delete pod
+* Update pod status based on Mesos TaskStatus events
+* Recover after a restart by using the Kubelet UID as a Mesos FrameworkID
 
 This is a beta version. A lot of features are not implemented yet.
+
+## Known Missing Features
+
+* Update a running pod
+* Readiness/Liveness probes
+* Container attach and logs
+* CNI/networking
+* GPU support
+* Pod statistics summary
+* Dynamic update of node (kubelet), especially capacity, currently  you must
+  specify the total capacity in the configuration and the node conditions are
+  hardcoded.
+* Have a clean way to reconcile tasks upon startup
 
 ## Build
 
@@ -17,6 +32,9 @@ make clean build
 ```
 
 ## Usage
+
+Properly set the `~/.kube/config` (using something like `minikube` for example,
+and then:
 
 ```
 bin/virtual-kubelet --privider mesos [...options]
