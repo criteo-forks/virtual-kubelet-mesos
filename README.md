@@ -54,7 +54,6 @@ Example config:
         "principal": "my-principal",
         "user": "my-user",
         "authMode": "basic",
-        "frameworkID": "dfd54ba6-200a-4cdf-b6ec-e77aa64a8f5f-0035",
         "failoverTimeoutDuration": "1h",
         "credentials": {
             "username": "my-principal",
